@@ -1,0 +1,8 @@
+services:
+  oled:
+    build: .
+    restart: unless-stopped
+    devices:
+      - /dev/i2c-1:/dev/i2c-1
+    volumes:
+      - /:/host:ro   # only so disk usage reflects the host
