@@ -50,3 +50,15 @@ pytest
 ```
 
 CI (GitHub Actions) runs the tests and a Docker build on every push and pull request. Hardware-specific details (I2C address, `/dev/i2c-1` passthrough, how the panel looks) can only be checked on a real Pi.
+
+## Troubleshooting
+
+If the display can't be reached (I2C disabled, OLED not connected, or no permission for `/dev/i2c-1`), the container prints an explanation to its logs and exits with a non-zero status. `restart: unless-stopped` makes Docker retry with an increasing delay, so it recovers on its own once the display is available. Check the reason with:
+
+```sh
+docker compose logs oled
+```
+
+If I2C is disabled on the host, `docker compose up` may fail before the container starts, because `/dev/i2c-1` doesn't exist.
+
+A missing CPU temperature sensor isn't fatal; the temperature line shows `n/a`.

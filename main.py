@@ -1,6 +1,8 @@
+import sys
 import time
 
 import psutil
+from luma.core.error import DeviceNotFoundError, DevicePermissionError
 from luma.core.render import canvas
 
 THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"
@@ -18,9 +20,13 @@ def cpu_temp(path=THERMAL_PATH):
 
 
 def read_stats(thermal_path=THERMAL_PATH, host_root=HOST_ROOT):
+    try:
+        temp = cpu_temp(thermal_path)
+    except (OSError, ValueError):
+        temp = None  # shown as n/a; a missing sensor shouldn't kill the display
     return {
         "cpu": psutil.cpu_percent(),
-        "temp": cpu_temp(thermal_path),
+        "temp": temp,
         "mem": psutil.virtual_memory().percent,
         "disk": psutil.disk_usage(host_root).percent,
     }
@@ -28,7 +34,8 @@ def read_stats(thermal_path=THERMAL_PATH, host_root=HOST_ROOT):
 
 def render(draw, stats):
     draw.text((0, 0), f"CPU  {stats['cpu']:5.1f}%", fill="white")
-    draw.text((0, 14), f"Temp {stats['temp']:5.1f}C", fill="white")
+    temp = "  n/a" if stats["temp"] is None else f"{stats['temp']:5.1f}C"
+    draw.text((0, 14), f"Temp {temp}", fill="white")
     draw.text((0, 28), f"Mem  {stats['mem']:5.1f}%", fill="white")
     draw.text((0, 42), f"Disk {stats['disk']:5.1f}%", fill="white")
 
@@ -54,5 +61,28 @@ def main(device=None, interval=REFRESH_SECONDS, iterations=None):
         time.sleep(interval)
 
 
+def cli():
+    """Run forever; on display failure, explain why on stderr and return 1."""
+    where = f"I2C bus {I2C_PORT}, address {I2C_ADDRESS:#04x}"
+    try:
+        main()
+    except DeviceNotFoundError as e:
+        print(
+            f"ERROR: could not talk to the OLED display ({where}): {e}\n"
+            "Check that I2C is enabled on the host (raspi-config), the display "
+            "is connected, and /dev/i2c-1 is passed into the container.",
+            file=sys.stderr,
+        )
+    except DevicePermissionError as e:
+        print(
+            f"ERROR: permission denied accessing the I2C device ({where}): {e}\n"
+            "Check that the container is allowed to access /dev/i2c-1.",
+            file=sys.stderr,
+        )
+    else:
+        return 0
+    return 1
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(cli())

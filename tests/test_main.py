@@ -2,6 +2,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from luma.core.device import dummy
+from luma.core.error import DeviceNotFoundError, DevicePermissionError
 
 import main
 
@@ -65,3 +66,60 @@ def test_main_runs_requested_iterations(monkeypatch):
     device = dummy(width=main.WIDTH, height=main.HEIGHT)
     main.main(device=device, interval=0, iterations=3)
     assert device.image.convert("L").getbbox() is not None
+
+
+def test_read_stats_missing_thermal_file_gives_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(main.psutil, "cpu_percent", lambda: 1.0)
+    monkeypatch.setattr(main.psutil, "virtual_memory", lambda: MagicMock(percent=2.0))
+    monkeypatch.setattr(main.psutil, "disk_usage", lambda p: MagicMock(percent=3.0))
+    stats = main.read_stats(thermal_path=str(tmp_path / "nope"))
+    assert stats["temp"] is None
+
+
+def test_render_shows_na_when_temp_missing():
+    draw = MagicMock()
+    main.render(draw, {**STATS, "temp": None})
+    texts = [c.args[1] for c in draw.text.call_args_list]
+    assert "Temp   n/a" in texts
+
+
+def test_cli_returns_zero_on_clean_exit(monkeypatch):
+    monkeypatch.setattr(main, "main", lambda: None)
+    assert main.cli() == 0
+
+
+def test_cli_explains_missing_display(monkeypatch, capsys):
+    def boom():
+        raise DeviceNotFoundError("I2C device not found: /dev/i2c-1")
+
+    monkeypatch.setattr(main, "make_device", boom)
+    assert main.cli() == 1
+    err = capsys.readouterr().err
+    assert "could not talk to the OLED display" in err
+    assert "I2C bus 1, address 0x3c" in err
+    assert "I2C device not found: /dev/i2c-1" in err
+    assert "raspi-config" in err
+
+
+def test_cli_explains_permission_error(monkeypatch, capsys):
+    def boom():
+        raise DevicePermissionError("I2C device permission denied: /dev/i2c-1")
+
+    monkeypatch.setattr(main, "make_device", boom)
+    assert main.cli() == 1
+    err = capsys.readouterr().err
+    assert "permission denied" in err
+
+
+def test_cli_explains_display_lost_mid_run(monkeypatch, capsys):
+    device = dummy(width=main.WIDTH, height=main.HEIGHT)
+    monkeypatch.setattr(main, "make_device", lambda: device)
+    monkeypatch.setattr(main, "read_stats", lambda: STATS)
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
+
+    def unplug(*a, **k):
+        raise DeviceNotFoundError("display disconnected")
+
+    monkeypatch.setattr(device, "display", unplug)
+    assert main.cli() == 1
+    assert "display disconnected" in capsys.readouterr().err
