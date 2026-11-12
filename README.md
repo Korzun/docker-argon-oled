@@ -51,6 +51,16 @@ pytest
 
 CI (GitHub Actions) runs the tests and a Docker build on every push and pull request. Hardware-specific details (I2C address, `/dev/i2c-1` passthrough, how the panel looks) can only be checked on a real Pi.
 
+## Health check
+
+The app serves `GET /health` on port 8080 (inside the container only; the port isn't published). It returns `200` while the display loop is redrawing, and `503` if it hasn't completed a redraw for 10 seconds or hasn't started yet:
+
+```json
+{"status": "ok", "seconds_since_update": 0.8}
+```
+
+`docker-compose.yml` defines a matching Docker `healthcheck`, which Docker and Coolify use to report the container as healthy or unhealthy. It mainly catches a hung display loop. If the display is missing or disconnected, the app exits with an explanation instead (see Troubleshooting).
+
 ## Troubleshooting
 
 If the display can't be reached (I2C disabled, OLED not connected, or no permission for `/dev/i2c-1`), the container prints an explanation to its logs and exits with a non-zero status. `restart: unless-stopped` makes Docker retry with an increasing delay, so it recovers on its own once the display is available. Check the reason with:

@@ -1,3 +1,7 @@
+import json
+import threading
+import urllib.error
+import urllib.request
 from unittest.mock import MagicMock
 
 import pytest
@@ -84,8 +88,8 @@ def test_render_shows_na_when_temp_missing():
 
 
 def test_cli_returns_zero_on_clean_exit(monkeypatch):
-    monkeypatch.setattr(main, "main", lambda: None)
-    assert main.cli() == 0
+    monkeypatch.setattr(main, "main", lambda **k: None)
+    assert main.cli(health_port=None) == 0
 
 
 def test_cli_explains_missing_display(monkeypatch, capsys):
@@ -93,7 +97,7 @@ def test_cli_explains_missing_display(monkeypatch, capsys):
         raise DeviceNotFoundError("I2C device not found: /dev/i2c-1")
 
     monkeypatch.setattr(main, "make_device", boom)
-    assert main.cli() == 1
+    assert main.cli(health_port=None) == 1
     err = capsys.readouterr().err
     assert "could not talk to the OLED display" in err
     assert "I2C bus 1, address 0x3c" in err
@@ -106,7 +110,7 @@ def test_cli_explains_permission_error(monkeypatch, capsys):
         raise DevicePermissionError("I2C device permission denied: /dev/i2c-1")
 
     monkeypatch.setattr(main, "make_device", boom)
-    assert main.cli() == 1
+    assert main.cli(health_port=None) == 1
     err = capsys.readouterr().err
     assert "permission denied" in err
 
@@ -121,5 +125,73 @@ def test_cli_explains_display_lost_mid_run(monkeypatch, capsys):
         raise DeviceNotFoundError("display disconnected")
 
     monkeypatch.setattr(device, "display", unplug)
-    assert main.cli() == 1
+    assert main.cli(health_port=None) == 1
     assert "display disconnected" in capsys.readouterr().err
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_health_status_starting_ok_and_stale():
+    clock = FakeClock()
+    hb = main.Heartbeat(clock=clock)
+    assert main.health_status(hb, max_age=10)[0] == 503
+    assert main.health_status(hb, max_age=10)[1]["status"] == "starting"
+
+    hb.beat()
+    clock.now += 4
+    code, body = main.health_status(hb, max_age=10)
+    assert (code, body["status"]) == (200, "ok")
+
+    clock.now += 7  # 11s since last beat
+    code, body = main.health_status(hb, max_age=10)
+    assert (code, body["status"]) == (503, "stale")
+
+
+def test_main_beats_heartbeat_each_iteration(monkeypatch):
+    monkeypatch.setattr(main, "read_stats", lambda: STATS)
+    hb = main.Heartbeat()
+    device = dummy(width=main.WIDTH, height=main.HEIGHT)
+    main.main(device=device, interval=0, iterations=1, heartbeat=hb)
+    assert hb.age() is not None
+
+
+@pytest.fixture
+def health_url():
+    clock = FakeClock()
+    hb = main.Heartbeat(clock=clock)
+    server = main.make_health_server(hb, port=0, host="127.0.0.1", max_age=10)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}", hb, clock
+    server.shutdown()
+    server.server_close()
+
+
+def _get(url):
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+
+
+def test_health_endpoint_over_http(health_url):
+    base, hb, clock = health_url
+    assert _get(base + "/health")[0] == 503  # nothing drawn yet
+
+    hb.beat()
+    code, body = _get(base + "/health")
+    assert (code, body["status"]) == (200, "ok")
+
+    clock.now += 60
+    assert _get(base + "/health")[0] == 503  # loop has gone quiet
+
+
+def test_health_endpoint_unknown_path_is_404(health_url):
+    base, _, _ = health_url
+    assert _get(base + "/nope")[0] == 404
