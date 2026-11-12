@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import threading
 import time
@@ -45,12 +46,32 @@ def render(draw, stats):
     draw.text((0, 42), f"Disk {stats['disk']:5.1f}%", fill="white")
 
 
-def make_device():
+def env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    value = value.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name}={value!r} is not a valid boolean (use true or false)")
+
+
+def make_device(flip=None):
+    """Build the display. `flip` rotates it 180 degrees; defaults to $FLIP_DISPLAY."""
     # Imported here so tests can import this module without I2C support.
     from luma.core.interface.serial import i2c
     from luma.oled.device import ssd1306
 
-    return ssd1306(i2c(port=I2C_PORT, address=I2C_ADDRESS), width=WIDTH, height=HEIGHT)
+    if flip is None:
+        flip = env_flag("FLIP_DISPLAY")
+    return ssd1306(
+        i2c(port=I2C_PORT, address=I2C_ADDRESS),
+        width=WIDTH,
+        height=HEIGHT,
+        rotate=2 if flip else 0,
+    )
 
 
 class Heartbeat:

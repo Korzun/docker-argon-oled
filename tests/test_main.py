@@ -195,3 +195,43 @@ def test_health_endpoint_over_http(health_url):
 def test_health_endpoint_unknown_path_is_404(health_url):
     base, _, _ = health_url
     assert _get(base + "/nope")[0] == 404
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, False), ("", False), ("true", True), ("TRUE", True), ("1", True),
+     ("yes", True), ("on", True), ("false", False), ("0", False), ("no", False)],
+)
+def test_env_flag_parsing(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("X_FLAG", raising=False)
+    else:
+        monkeypatch.setenv("X_FLAG", value)
+    assert main.env_flag("X_FLAG") is expected
+
+
+def test_env_flag_rejects_garbage(monkeypatch):
+    monkeypatch.setenv("X_FLAG", "maybe")
+    with pytest.raises(ValueError, match="X_FLAG"):
+        main.env_flag("X_FLAG")
+
+
+@pytest.mark.parametrize("env,arg,rotate", [
+    (None, None, 0), ("true", None, 2), ("false", None, 0),
+    ("false", True, 2), ("true", False, 0),
+])
+def test_make_device_rotation(monkeypatch, env, arg, rotate):
+    import luma.core.interface.serial as serial
+    import luma.oled.device as oled
+
+    if env is None:
+        monkeypatch.delenv("FLIP_DISPLAY", raising=False)
+    else:
+        monkeypatch.setenv("FLIP_DISPLAY", env)
+    fake_ssd1306 = MagicMock()
+    monkeypatch.setattr(serial, "i2c", MagicMock())
+    monkeypatch.setattr(oled, "ssd1306", fake_ssd1306)
+
+    main.make_device(flip=arg)
+
+    assert fake_ssd1306.call_args.kwargs["rotate"] == rotate

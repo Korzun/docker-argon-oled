@@ -6,6 +6,8 @@ services:
       - /dev/i2c-1:/dev/i2c-1
     volumes:
       - /:/host:ro   # only so disk usage reflects the host
+    environment:
+      - FLIP_DISPLAY=${FLIP_DISPLAY:-false}   # set true if the display is mounted upside-down
     healthcheck:
       # No curl in the slim image; urlopen raises on a 503, failing the check.
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]

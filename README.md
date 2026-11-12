@@ -37,7 +37,11 @@ docker compose down
 
 ## Configuration
 
-There are no runtime options yet. To change the I2C port or address, the display size, or the refresh interval, edit the constants in `main.py` and rebuild.
+| Variable       | Default | Description                                         |
+| -------------- | ------- | --------------------------------------------------- |
+| `FLIP_DISPLAY` | `false` | Set to `true` to rotate the display 180° (for a panel mounted upside-down). Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
+
+Set it in a `.env` file next to `docker-compose.yml`, in your shell, or in Coolify's Environment Variables, then redeploy. Other settings are not configurable at runtime yet. To change the I2C port or address, the display size, or the refresh interval, edit the constants in `main.py` and rebuild.
 
 ## Development
 
