@@ -38,3 +38,15 @@ docker compose down
 ## Configuration
 
 There are no runtime options yet. To change the I2C port or address, the display size, or the refresh interval, edit the constants in `main.py` and rebuild.
+
+## Development
+
+Tests run without a Pi or I2C hardware, using luma's in-memory `dummy` display:
+
+```sh
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+```
+
+CI (GitHub Actions) runs the tests and a Docker build on every push and pull request. Hardware-specific details (I2C address, `/dev/i2c-1` passthrough, how the panel looks) can only be checked on a real Pi.
