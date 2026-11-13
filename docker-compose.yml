@@ -1,16 +1,40 @@
 services:
+  # Read-only view of Docker for container health. The app never touches the
+  # Docker socket itself; only this proxy mounts it, and it only allows GETs
+  # on the containers endpoints.
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    restart: unless-stopped
+    environment:
+      - CONTAINERS=1
+      - POST=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "127.0.0.1:2375:2375"   # loopback only: reachable from the Pi, not the LAN
+
   oled:
     build: .
     restart: unless-stopped
+    # Host networking so the display can show the Pi's real LAN IP and reach the
+    # proxy on 127.0.0.1. /health also binds to 127.0.0.1 only.
+    network_mode: host
+    depends_on:
+      - docker-proxy
     devices:
       - /dev/i2c-1:/dev/i2c-1
+      - ${GPIO_DEVICE:-/dev/gpiochip0}:${GPIO_DEVICE:-/dev/gpiochip0}   # header chip (pinctrl-rp1)
     volumes:
-      - /:/host:ro   # only so disk usage reflects the host
+      - /:/host:ro   # only so disk usage and hostname reflect the host
     environment:
       - FLIP_DISPLAY=${FLIP_DISPLAY:-false}   # set true if the display is mounted upside-down
+      - BUTTON_GPIO=${BUTTON_GPIO:-4}
+      - BUTTON_CHIP=${GPIO_DEVICE:-/dev/gpiochip0}
+      - DOCKER_PROXY_URL=http://127.0.0.1:2375
+      - HEALTH_PORT=${HEALTH_PORT:-8099}
     healthcheck:
       # No curl in the slim image; urlopen raises on a 503, failing the check.
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('HEALTH_PORT', '8099'), timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3

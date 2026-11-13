@@ -22,4 +22,5 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - run: docker compose config -q
       - run: docker build -t docker-argon-oled .
