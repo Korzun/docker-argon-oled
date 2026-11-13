@@ -139,15 +139,23 @@ def _clip(draw, text: str, font, max_px: float) -> str:
     return text
 
 
-def draw_page(draw, content: PageContent, offset: tuple[int, int] = (0, 0)) -> None:
+def draw_page(
+    draw, content: PageContent, offset: tuple[int, int] = (0, 0), inverted: bool = True
+) -> None:
+    """Draw a page. `inverted=False` gives a plain title with a 1 px rule, lighting far fewer pixels
+    (used during alerts, when the screen can stay on for days)."""
     ox, oy = offset
     font = load_font()
     margin = 2
-    draw.rectangle((ox, oy, ox + WIDTH - 1, oy + TITLE_H - 1), fill="white")
+    fg = "black" if inverted else "white"
+    if inverted:
+        draw.rectangle((ox, oy, ox + WIDTH - 1, oy + TITLE_H - 1), fill="white")
+    else:
+        draw.line((ox, oy + TITLE_H, ox + WIDTH - 1, oy + TITLE_H), fill="white")
     counter_w = draw.textlength(content.counter, font=font)
     title = _clip(draw, content.title, font, WIDTH - 3 * margin - counter_w)
-    draw.text((ox + margin, oy), title, fill="black", font=font)
-    draw.text((ox + WIDTH - margin - counter_w, oy), content.counter, fill="black", font=font)
+    draw.text((ox + margin, oy), title, fill=fg, font=font)
+    draw.text((ox + WIDTH - margin - counter_w, oy), content.counter, fill=fg, font=font)
     for i, row in enumerate(content.rows[:MAX_ROWS]):
         row = _clip(draw, row, font, WIDTH - 2 * margin)
         draw.text((ox + margin, oy + TITLE_H + 2 + i * ROW_H), row, fill="white", font=font)

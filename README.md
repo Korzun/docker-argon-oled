@@ -22,7 +22,7 @@ pi-basement               CPU   12.3%
 
 Container statuses: `ok` (healthy), `bad` (unhealthy), `..` (health check starting), `-` (running, no health check), `stopped`.
 
-**Alerts.** When a container's Docker health status becomes `unhealthy`, the screen wakes on its own, jumps to the Containers page (title `! UNHEALTHY`) and stays lit, at reduced contrast with the content drifting a pixel every minute so the panel doesn't burn in. Press the button to acknowledge: it returns to normal paging and goes dark after 30 seconds. If the problem is still there an hour later it wakes again; a new or re-failing container wakes it immediately. If every unhealthy container recovers on its own, the screen simply turns off.
+**Alerts.** When a container's Docker health status becomes `unhealthy`, the screen wakes on its own, jumps to the Containers page (title `! UNHEALTHY`) and stays lit, at reduced contrast, with the content drifting a pixel every minute and a plain title (a thin rule instead of the filled bar, so far fewer pixels are lit) so the panel doesn't burn in. Press the button to acknowledge: it returns to normal paging and goes dark after 30 seconds. If the problem is still there an hour later it wakes again; a new or re-failing container wakes it immediately. If every unhealthy container recovers on its own, the screen simply turns off.
 
 ## Requirements
 
@@ -53,6 +53,7 @@ The container restarts automatically unless stopped (`restart: unless-stopped`).
 | `GPIO_DEVICE`     | `/dev/gpiochip0`   | GPIO chip device passed into the container and used for the button. On a Pi 5, `gpiodetect` shows the header chip as `pinctrl-rp1`. |
 | `BUTTON_GPIO`     | `4`                | GPIO line of the OLED button on that chip (active-low). |
 | `HEALTH_PORT`     | `8099`             | Port for the `/health` endpoint, bound to `127.0.0.1`. |
+| `PROXY_PORT`      | `2375`             | Host loopback port the Docker proxy is published on, and where the app looks for it. |
 | `HOST_IP`         | (auto-detected)    | Override the IP address shown, if auto-detection picks the wrong one. |
 
 Set variables in a `.env` file next to `docker-compose.yml`, in your shell, or in Coolify's Environment Variables, then redeploy (a restart doesn't pick them up). Other settings, such as the wake timeout, I2C address or display size, are constants in the code.
@@ -89,4 +90,4 @@ docker compose logs oled
 
 If I2C is disabled on the host, or `GPIO_DEVICE` names a device that doesn't exist, `docker compose up` may fail before the container starts, because Docker can't map a missing device.
 
-If the Containers page says `Docker n/a`, the proxy isn't reachable; check `docker compose logs docker-proxy`. A missing CPU temperature sensor isn't fatal; the temperature shows `n/a`.
+If the Containers page says `Docker n/a`, the proxy isn't reachable; the app logs a warning with the URL it tried (and a note when it comes back), and `docker compose logs docker-proxy` shows the proxy's side. If `/health` can't start because its port is taken, the app says so and exits; set `HEALTH_PORT` to a free port. A missing CPU temperature sensor isn't fatal; the temperature shows `n/a`.

@@ -84,7 +84,7 @@ class Settings:
     @classmethod
     def from_env(cls, environ=os.environ) -> "Settings":
         return cls(
-            proxy_url=environ.get("DOCKER_PROXY_URL") or cls.proxy_url,
+            proxy_url=(environ.get("DOCKER_PROXY_URL") or cls.proxy_url).rstrip("/"),
             button_line=_env_int(environ, "BUTTON_GPIO", cls.button_line),
             button_chip=environ.get("BUTTON_CHIP") or None,
             health_port=_env_int(environ, "HEALTH_PORT", cls.health_port),
@@ -197,6 +197,7 @@ def main(
     snapshot = None
     last_containers = None  # last container list we actually got, for the alert page
     collect_failing = False
+    proxy_down = False
     last_refresh = None
     previous_mode = None
     drawn = None
@@ -218,6 +219,16 @@ def main(
                 snapshot = fresh
                 if fresh.containers is not None:
                     last_containers = fresh.containers
+                    if proxy_down:
+                        print("INFO: Docker proxy reachable again", file=sys.stderr)
+                    proxy_down = False
+                elif not proxy_down:
+                    print(
+                        f"WARNING: Docker proxy unreachable at {settings.proxy_url}; container info shows "
+                        "n/a. Check DOCKER_PROXY_URL and `docker compose logs docker-proxy`.",
+                        file=sys.stderr,
+                    )
+                    proxy_down = True
                 controller.on_containers(unhealthy_names(fresh.containers))
         while True:
             try:
@@ -243,7 +254,7 @@ def main(
                     shown = replace(snapshot, containers=last_containers)  # keep naming the bad containers
                 content = build_page(controller.page, shown, alert=mode is Mode.ALERT)
                 with canvas(device) as draw:
-                    draw_page(draw, content, offset)
+                    draw_page(draw, content, offset, inverted=mode is not Mode.ALERT)
                 drawn = key
 
         if heartbeat is not None:
@@ -270,7 +281,15 @@ def cli(settings=None, serve_health=True):
     where = f"I2C bus {I2C_PORT}, address {I2C_ADDRESS:#04x}"
     heartbeat = Heartbeat()
     if serve_health:
-        server = make_health_server(heartbeat, port=settings.health_port)
+        try:
+            server = make_health_server(heartbeat, port=settings.health_port)
+        except OSError as e:
+            print(
+                f"ERROR: could not start the /health endpoint on 127.0.0.1:{settings.health_port}: {e}\n"
+                "Set HEALTH_PORT to a free port.",
+                file=sys.stderr,
+            )
+            return 1
         threading.Thread(target=server.serve_forever, daemon=True).start()
     events = queue.Queue()
     try:

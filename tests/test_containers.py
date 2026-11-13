@@ -143,3 +143,10 @@ def test_fetch_returns_none_on_truncated_body_from_a_real_socket():
         assert containers.fetch_containers(url, timeout=2) is None
     finally:
         server.close()
+
+
+def test_fetch_tolerates_a_trailing_slash_in_the_base_url():
+    seen = []
+    body = json.dumps([entry("x")]).encode()
+    containers.fetch_containers("http://127.0.0.1:2375/", opener=opener_returning(body, seen))
+    assert seen == ["http://127.0.0.1:2375/containers/json?all=1"]

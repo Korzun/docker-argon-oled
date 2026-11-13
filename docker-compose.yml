@@ -11,7 +11,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
-      - "127.0.0.1:2375:2375"   # loopback only: reachable from the Pi, not the LAN
+      - "127.0.0.1:${PROXY_PORT:-2375}:2375"   # loopback only: reachable from the Pi, not the LAN
 
   oled:
     build: .
@@ -30,7 +30,7 @@ services:
       - FLIP_DISPLAY=${FLIP_DISPLAY:-false}   # set true if the display is mounted upside-down
       - BUTTON_GPIO=${BUTTON_GPIO:-4}
       - BUTTON_CHIP=${GPIO_DEVICE:-/dev/gpiochip0}
-      - DOCKER_PROXY_URL=http://127.0.0.1:2375
+      - DOCKER_PROXY_URL=http://127.0.0.1:${PROXY_PORT:-2375}
       - HEALTH_PORT=${HEALTH_PORT:-8099}
       - HOST_IP=${HOST_IP:-}   # optional: override the IP shown on screen
     healthcheck:

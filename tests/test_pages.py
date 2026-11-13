@@ -172,3 +172,26 @@ def test_alert_page_stays_inside_screen(offset):
     content = pages.build_page(PAGE_CONTAINERS, snap(cs), alert=True)
     _, box = lit_box(content, offset)
     assert box[2] <= pages.WIDTH + offset[0] and box[3] <= pages.HEIGHT
+
+
+def title_lit_fraction(content, inverted):
+    device = dummy(width=pages.WIDTH, height=pages.HEIGHT)
+    with canvas(device) as draw:
+        pages.draw_page(draw, content, inverted=inverted)
+    band = device.image.convert("L").crop((0, 0, pages.WIDTH, pages.TITLE_H - 1))
+    return sum(1 for p in band.getdata() if p) / (pages.WIDTH * (pages.TITLE_H - 1))
+
+
+def test_non_inverted_title_lights_far_fewer_pixels():
+    assert title_lit_fraction(FULL, inverted=True) > 0.5
+    assert title_lit_fraction(FULL, inverted=False) < 0.25
+
+
+def test_non_inverted_title_still_has_a_separator_and_stays_inside_screen():
+    content = pages.build_page(PAGE_CONTAINERS, snap([c("x" * 40, health="unhealthy")]), alert=True)
+    image = Image.new("1", (256, 128), 0)
+    pages.draw_page(ImageDraw.Draw(image), content, (1, 1), inverted=False)
+    box = image.getbbox()
+    assert box[2] <= pages.WIDTH + 1 and box[3] <= pages.HEIGHT
+    rule_y = pages.TITLE_H + 1  # the 1 px rule sits just under the title band, shifted by the y offset
+    assert all(image.getpixel((x, rule_y)) for x in range(2, 100))

@@ -30,8 +30,13 @@ class PressClassifier:
         self._pressed_at: float | None = None
         self._long_fired = False
 
-    def on_edge(self, pressed: bool) -> ButtonEvent | None:
-        now = self._clock()
+    @property
+    def is_held(self) -> bool:
+        return self._pressed_at is not None
+
+    def on_edge(self, pressed: bool, at: float | None = None) -> ButtonEvent | None:
+        """`at` is when the edge really happened (monotonic seconds); default is now."""
+        now = self._clock() if at is None else at
         if pressed:
             if self._pressed_at is None:
                 self._pressed_at = now
@@ -57,10 +62,23 @@ class PressClassifier:
 
 
 def pump_events(source, classifier: PressClassifier, out: queue.Queue, stop: threading.Event) -> None:
-    """Read edges from `source` until `stop` is set, putting classified events on `out`."""
+    """Read edges from `source` until `stop` is set, putting classified events on `out`.
+
+    `source.wait_edge(timeout)` returns `(pressed, timestamp)` or None on timeout. If the
+    source also has `is_pressed()`, a release whose edge never arrived is detected from the
+    real line state.
+    """
     while not stop.is_set():
         edge = source.wait_edge(POLL_SECONDS)
-        event = classifier.on_edge(edge) if edge is not None else classifier.poll()
+        if edge is not None:
+            pressed, at = edge
+            event = classifier.on_edge(pressed, at)
+        else:
+            event = classifier.poll()
+            if event is None and classifier.is_held:
+                is_pressed = getattr(source, "is_pressed", None)
+                if is_pressed is not None and not is_pressed():
+                    event = classifier.on_edge(False)
         if event is not None:
             out.put(event)
 
@@ -72,7 +90,7 @@ class GpiodEdgeSource:
         path = self._resolve_chip(chip)
         try:
             import gpiod
-            from gpiod.line import Bias, Direction, Edge
+            from gpiod.line import Bias, Direction, Edge, Value
         except ImportError as e:
             raise ButtonUnavailableError(f"the gpiod library is not installed ({e})") from e
         try:
@@ -92,6 +110,8 @@ class GpiodEdgeSource:
                 f"could not use GPIO line {line} on {path}: {e}. If the line is busy, another "
                 "program (such as Argon's own daemon) may be using it."
             ) from e
+        self._line = line
+        self._pressed_value = Value.INACTIVE  # pull-up: physical low (pressed) reads INACTIVE
         self._buffer: collections.deque = collections.deque()
 
     @staticmethod
@@ -109,13 +129,18 @@ class GpiodEdgeSource:
             "no /dev/gpiochip* device found; pass the header GPIO chip into the container"
         )
 
-    def wait_edge(self, timeout: float) -> bool | None:
+    def wait_edge(self, timeout: float) -> tuple[bool, float] | None:
+        """Next edge as (pressed, monotonic seconds when it happened), or None on timeout."""
         if not self._buffer:
             if not self._request.wait_edge_events(timeout=timeout):
                 return None
             for event in self._request.read_edge_events():
-                self._buffer.append(event.event_type == event.Type.FALLING_EDGE)
+                pressed = event.event_type == event.Type.FALLING_EDGE
+                self._buffer.append((pressed, event.timestamp_ns / 1e9))
         return self._buffer.popleft() if self._buffer else None
+
+    def is_pressed(self) -> bool:
+        return self._request.get_value(self._line) == self._pressed_value
 
 
 def start_button(

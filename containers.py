@@ -54,7 +54,7 @@ def fetch_containers(
 ) -> list[Container] | None:
     """List containers through the read-only Docker proxy; None if anything goes wrong."""
     try:
-        with opener(f"{base_url}/containers/json?all=1", timeout=timeout) as resp:
+        with opener(f"{base_url.rstrip('/')}/containers/json?all=1", timeout=timeout) as resp:
             payload = json.load(resp)
     except (OSError, ValueError, http.client.HTTPException):
         return None

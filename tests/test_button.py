@@ -145,8 +145,9 @@ def test_recorded_long_hold_fires_one_long_and_no_short(clf, clock):
 class FakeSource:
     """Scripted EdgeSource: each entry is (seconds_to_advance, edge)."""
 
-    def __init__(self, clock, script, stop):
+    def __init__(self, clock, script, stop, line_pressed=None):
         self.clock, self.script, self.stop = clock, list(script), stop
+        self.line_pressed = line_pressed  # what is_pressed() reports; None = source has no such method
 
     def wait_edge(self, timeout):
         if not self.script:
@@ -154,7 +155,10 @@ class FakeSource:
             return None
         dt, edge = self.script.pop(0)
         self.clock.now += dt
-        return edge
+        return None if edge is None else (edge, self.clock.now)
+
+    def is_pressed(self):
+        return self.line_pressed
 
 
 def test_pump_events_puts_classified_events_on_queue(clock):
@@ -182,7 +186,7 @@ def test_start_button_pumps_events_with_a_source(monkeypatch):
                 time.sleep(timeout)
                 return None
             time.sleep(0.06)
-            return self.steps.pop(0)
+            return (self.steps.pop(0), time.monotonic())
 
     monkeypatch.setattr(button, "GpiodEdgeSource", Source)
     thread = button.start_button(4, None, out, stop=stop)
@@ -243,3 +247,164 @@ def test_button_thread_failure_is_reported_on_the_queue(monkeypatch):
     finally:
         stop.set()
         thread.join(timeout=2)
+
+
+# --- event timestamps -----------------------------------------------------
+
+
+def test_classifier_uses_event_timestamps_not_processing_time(clf, clock):
+    clock.now = 99.0  # both edges are processed late and at the same instant
+    assert clf.on_edge(True, 10.0) is None
+    assert clf.on_edge(False, 10.08) == SHORT
+
+
+def test_without_timestamps_a_batched_tap_is_dropped_as_bounce(clf, clock):
+    clock.now = 99.0
+    clf.on_edge(True)
+    assert clf.on_edge(False) is None  # why event timestamps matter
+
+
+# --- resync with the real line state --------------------------------------
+
+
+def test_pump_synthesizes_a_release_when_the_line_is_already_released(clock):
+    stop = threading.Event()
+    out = queue.Queue()
+    source = FakeSource(clock, [(0.0, True), (0.2, None)], stop, line_pressed=False)
+    pump_events(source, PressClassifier(clock=clock), out, stop)
+    assert out.get_nowait() == SHORT  # the rising edge never arrived
+
+
+def test_pump_does_not_resync_while_the_line_is_still_pressed(clock):
+    stop = threading.Event()
+    out = queue.Queue()
+    source = FakeSource(clock, [(0.0, True), (0.2, None), (0.2, None)], stop, line_pressed=True)
+    pump_events(source, PressClassifier(clock=clock), out, stop)
+    assert out.empty()
+
+
+def test_pump_works_with_a_source_that_has_no_is_pressed(clock):
+    class Bare:
+        def __init__(self):
+            self.n = 0
+
+        def wait_edge(self, timeout):
+            self.n += 1
+            if self.n == 1:
+                return (True, clock.now)
+            stop.set()
+            return None
+
+    stop = threading.Event()
+    out = queue.Queue()
+    pump_events(Bare(), PressClassifier(clock=clock), out, stop)
+    assert out.empty()
+
+
+# --- GpiodEdgeSource against a fake gpiod module --------------------------
+
+
+class _Enum:
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return self.name
+
+
+class FakeEvent:
+    class Type:
+        FALLING_EDGE = _Enum("FALLING")
+        RISING_EDGE = _Enum("RISING")
+
+    def __init__(self, falling, ns):
+        self.event_type = self.Type.FALLING_EDGE if falling else self.Type.RISING_EDGE
+        self.timestamp_ns = ns
+
+
+class FakeRequest:
+    def __init__(self):
+        self.waits = 0
+        self.pending = []
+        self.value = None
+
+    def wait_edge_events(self, timeout=None):
+        self.waits += 1
+        return bool(self.pending)
+
+    def read_edge_events(self):
+        events, self.pending = self.pending, []
+        return events
+
+    def get_value(self, line):
+        return self.value
+
+
+@pytest.fixture
+def fake_gpiod(monkeypatch, tmp_path):
+    import types
+
+    module = types.ModuleType("gpiod")
+    line = types.ModuleType("gpiod.line")
+    line.Bias = types.SimpleNamespace(PULL_UP=_Enum("PULL_UP"))
+    line.Direction = types.SimpleNamespace(INPUT=_Enum("INPUT"))
+    line.Edge = types.SimpleNamespace(BOTH=_Enum("BOTH"))
+    line.Value = types.SimpleNamespace(ACTIVE=_Enum("ACTIVE"), INACTIVE=_Enum("INACTIVE"))
+    module.line = line
+    module.LineSettings = lambda **kw: kw
+    module.request = FakeRequest()
+    module.calls = []
+    module.error = None
+
+    def request_lines(path, consumer, config):
+        module.calls.append((path, consumer, config))
+        if module.error:
+            raise module.error
+        return module.request
+
+    module.request_lines = request_lines
+    monkeypatch.setitem(sys.modules, "gpiod", module)
+    monkeypatch.setitem(sys.modules, "gpiod.line", line)
+    chip = tmp_path / "gpiochip0"
+    chip.write_text("")
+    module.chip = str(chip)
+    return module
+
+
+def test_gpiod_source_requests_the_line_with_pull_up_and_both_edges(fake_gpiod):
+    button.GpiodEdgeSource(4, fake_gpiod.chip)
+    path, consumer, config = fake_gpiod.calls[0]
+    assert path == fake_gpiod.chip and consumer == "oled-button"
+    assert list(config) == [4]
+    assert config[4]["bias"].name == "PULL_UP" and config[4]["edge_detection"].name == "BOTH"
+
+
+def test_gpiod_source_returns_edges_with_timestamps_and_buffers_batches(fake_gpiod):
+    source = button.GpiodEdgeSource(4, fake_gpiod.chip)
+    fake_gpiod.request.pending = [FakeEvent(True, 2_000_000_000), FakeEvent(False, 2_090_000_000)]
+    assert source.wait_edge(0.05) == (True, 2.0)
+    waits = fake_gpiod.request.waits
+    assert source.wait_edge(0.05) == (False, pytest.approx(2.09))
+    assert fake_gpiod.request.waits == waits  # second edge came from the buffer
+    assert source.wait_edge(0.05) is None  # nothing left, timeout
+
+
+def test_gpiod_source_is_pressed_reads_the_line(fake_gpiod):
+    source = button.GpiodEdgeSource(4, fake_gpiod.chip)
+    fake_gpiod.request.value = sys.modules["gpiod.line"].Value.INACTIVE  # physical low = pressed
+    assert source.is_pressed() is True
+    fake_gpiod.request.value = sys.modules["gpiod.line"].Value.ACTIVE
+    assert source.is_pressed() is False
+
+
+def test_gpiod_source_permission_error_is_explained(fake_gpiod):
+    fake_gpiod.error = PermissionError(13, "Permission denied")
+    with pytest.raises(ButtonUnavailableError, match="permission denied"):
+        button.GpiodEdgeSource(4, fake_gpiod.chip)
+
+
+def test_gpiod_source_busy_line_is_explained(fake_gpiod):
+    fake_gpiod.error = OSError(16, "Device or resource busy")
+    with pytest.raises(ButtonUnavailableError) as exc:
+        button.GpiodEdgeSource(4, fake_gpiod.chip)
+    assert "GPIO line 4" in str(exc.value) and "busy" in str(exc.value)

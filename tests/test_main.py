@@ -1,6 +1,7 @@
 import json
 import queue
 import signal
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -484,3 +485,63 @@ def test_every_documented_env_var_is_forwarded_by_compose():
     assert names, "no variables found in the README Configuration table"
     missing = [n for n in names if n not in compose]
     assert not missing, f"documented but not forwarded by docker-compose.yml: {missing}"
+
+
+# --- deferred minors ------------------------------------------------------
+
+
+def test_cli_explains_health_port_clash(monkeypatch, capsys, restore_sigterm):
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    try:
+        port = blocker.getsockname()[1]
+        assert main.cli(settings=main.Settings(health_port=port)) == 1
+    finally:
+        blocker.close()
+    err = capsys.readouterr().err
+    assert "/health" in err and "HEALTH_PORT" in err and str(port) in err
+
+
+def test_settings_strip_trailing_slash_from_proxy_url():
+    assert main.Settings.from_env({"DOCKER_PROXY_URL": "http://h:1/"}).proxy_url == "http://h:1"
+
+
+def test_proxy_failure_and_recovery_are_logged_once_each(capsys):
+    loop = Loop()
+    calls = {"n": 0}
+
+    def flaky_proxy(url):
+        calls["n"] += 1
+        down = 2 <= calls["n"] <= 4
+        return Snapshot(stats=STATS, containers=None if down else GOOD, host=HOST)
+
+    loop.collect = flaky_proxy
+    loop.run(100)
+    err = capsys.readouterr().err
+    assert err.count("Docker proxy unreachable") == 1
+    assert err.count("Docker proxy reachable again") == 1
+    assert "http://127.0.0.1:2375" in err
+
+
+def test_alert_title_bar_is_not_inverted_but_normal_pages_are():
+    def title_fraction(device):
+        band = device.image.convert("L").crop((0, 0, main.WIDTH, 10))
+        return sum(1 for p in band.getdata() if p) / (main.WIDTH * 10)
+
+    calm = Loop()
+    calm.events.put(ButtonEvent.SHORT)
+    calm.run(3)
+    alert = Loop(containers=BAD)
+    alert.run(3)
+    assert title_fraction(calm.device) > 0.5
+    assert title_fraction(alert.device) < 0.25
+
+
+def test_proxy_port_is_configurable_in_compose():
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    compose = open(os.path.join(root, "docker-compose.yml")).read()
+    assert "127.0.0.1:${PROXY_PORT:-2375}:2375" in compose
+    assert "DOCKER_PROXY_URL=http://127.0.0.1:${PROXY_PORT:-2375}" in compose
