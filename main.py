@@ -1,23 +1,36 @@
+from __future__ import annotations
+
 import json
 import os
+import queue
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psutil
 from luma.core.error import DeviceNotFoundError, DevicePermissionError
 from luma.core.render import canvas
 
+from button import ButtonUnavailableError, start_button
+from containers import fetch_containers, unhealthy_names
+from pages import Snapshot, build_page, draw_page, drift_offset
+from state import Controller, Mode
+from sysinfo import read_host_info
+
 THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"
 HOST_ROOT = "/host"
 REFRESH_SECONDS = 2
-HEALTH_PORT = 8080
-HEALTH_MAX_AGE = 5 * REFRESH_SECONDS  # unhealthy if no redraw for this long
+TICK_SECONDS = 0.1
+HEALTH_PORT = 8099
+HEALTH_MAX_AGE = 5 * REFRESH_SECONDS  # unhealthy if the loop hasn't ticked for this long
 I2C_PORT = 1
 I2C_ADDRESS = 0x3C
 WIDTH = 128
 HEIGHT = 64
+NORMAL_CONTRAST = 255
+ALERT_CONTRAST = 64
 
 
 def cpu_temp(path=THERMAL_PATH):
@@ -38,14 +51,6 @@ def read_stats(thermal_path=THERMAL_PATH, host_root=HOST_ROOT):
     }
 
 
-def render(draw, stats):
-    draw.text((0, 0), f"CPU  {stats['cpu']:5.1f}%", fill="white")
-    temp = "  n/a" if stats["temp"] is None else f"{stats['temp']:5.1f}C"
-    draw.text((0, 14), f"Temp {temp}", fill="white")
-    draw.text((0, 28), f"Mem  {stats['mem']:5.1f}%", fill="white")
-    draw.text((0, 42), f"Disk {stats['disk']:5.1f}%", fill="white")
-
-
 def env_flag(name, default=False):
     value = os.environ.get(name)
     if value is None or value.strip() == "":
@@ -56,6 +61,33 @@ def env_flag(name, default=False):
     if value in ("0", "false", "no", "off"):
         return False
     raise ValueError(f"{name}={value!r} is not a valid boolean (use true or false)")
+
+
+def _env_int(environ, name, default):
+    value = environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name}={value!r} is not a whole number") from None
+
+
+@dataclass(frozen=True)
+class Settings:
+    proxy_url: str = "http://127.0.0.1:2375"
+    button_line: int = 4
+    button_chip: str | None = None
+    health_port: int = HEALTH_PORT
+
+    @classmethod
+    def from_env(cls, environ=os.environ) -> "Settings":
+        return cls(
+            proxy_url=environ.get("DOCKER_PROXY_URL") or cls.proxy_url,
+            button_line=_env_int(environ, "BUTTON_GPIO", cls.button_line),
+            button_chip=environ.get("BUTTON_CHIP") or None,
+            health_port=_env_int(environ, "HEALTH_PORT", cls.health_port),
+        )
 
 
 def make_device(flip=None):
@@ -75,7 +107,7 @@ def make_device(flip=None):
 
 
 class Heartbeat:
-    """Records when the display loop last completed a successful redraw."""
+    """Records when the main loop last completed a tick (lit or dark)."""
 
     def __init__(self, clock=time.monotonic):
         self._clock = clock
@@ -91,7 +123,7 @@ class Heartbeat:
 
 
 def health_status(heartbeat, max_age=HEALTH_MAX_AGE):
-    """Return (http_status, body) describing whether the display loop is alive."""
+    """Return (http_status, body) describing whether the main loop is alive."""
     age = heartbeat.age()
     if age is None:
         return 503, {"status": "starting"}
@@ -100,7 +132,7 @@ def health_status(heartbeat, max_age=HEALTH_MAX_AGE):
     return 200, {"status": "ok", "seconds_since_update": round(age, 1)}
 
 
-def make_health_server(heartbeat, port=HEALTH_PORT, host="0.0.0.0", max_age=HEALTH_MAX_AGE):
+def make_health_server(heartbeat, port=HEALTH_PORT, host="127.0.0.1", max_age=HEALTH_MAX_AGE):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path != "/health":
@@ -120,33 +152,113 @@ def make_health_server(heartbeat, port=HEALTH_PORT, host="0.0.0.0", max_age=HEAL
     return ThreadingHTTPServer((host, port), Handler)
 
 
-def main(device=None, interval=REFRESH_SECONDS, iterations=None, heartbeat=None):
-    """Draw stats forever, or `iterations` times if given (used by tests)."""
-    if device is None:
-        device = make_device()
+def collect_snapshot(proxy_url: str) -> Snapshot:
+    return Snapshot(
+        stats=read_stats(),
+        containers=fetch_containers(proxy_url),
+        host=read_host_info(ip_override=os.environ.get("HOST_IP") or None),
+    )
+
+
+def apply_mode(device, mode: Mode, previous: Mode | None) -> None:
+    """Switch the panel on or off and set contrast, only when the mode changes."""
+    if mode is previous:
+        return
+    if mode is Mode.OFF:
+        device.hide()
+        return
+    if previous is None or previous is Mode.OFF:
+        device.show()
+    device.contrast(ALERT_CONTRAST if mode is Mode.ALERT else NORMAL_CONTRAST)
+
+
+def main(
+    device=None,
+    settings=None,
+    controller=None,
+    events=None,
+    heartbeat=None,
+    collect=None,
+    clock=None,
+    sleep=None,
+    tick: float = TICK_SECONDS,
+    iterations=None,
+):
+    """Run the display loop forever, or `iterations` ticks if given (used by tests)."""
+    collect = collect or collect_snapshot
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    settings = settings or Settings.from_env()
+    device = device or make_device()
+    controller = controller or Controller(clock=clock)
+    events = events if events is not None else queue.Queue()
+
+    snapshot = None
+    last_refresh = None
+    previous_mode = None
+    drawn = None
     count = 0
     while iterations is None or count < iterations:
-        stats = read_stats()
-        with canvas(device) as draw:
-            render(draw, stats)
+        now = clock()
+        refreshed = last_refresh is None or now - last_refresh >= REFRESH_SECONDS
+        if refreshed:
+            snapshot = collect(settings.proxy_url)
+            last_refresh = now
+            controller.on_containers(unhealthy_names(snapshot.containers))
+        while True:
+            try:
+                controller.on_button(events.get_nowait())
+            except queue.Empty:
+                break
+        controller.tick()
+
+        mode = controller.mode
+        apply_mode(device, mode, previous_mode)
+        previous_mode = mode
+        if mode is Mode.OFF:
+            drawn = None
+        else:
+            offset = drift_offset(controller.alert_elapsed()) if mode is Mode.ALERT else (0, 0)
+            key = (mode, controller.page, offset)
+            if refreshed or key != drawn:
+                content = build_page(controller.page, snapshot, alert=mode is Mode.ALERT)
+                with canvas(device) as draw:
+                    draw_page(draw, content, offset)
+                drawn = key
+
         if heartbeat is not None:
             heartbeat.beat()
         count += 1
-        time.sleep(interval)
+        sleep(tick)
 
 
-def cli(health_port=HEALTH_PORT):
-    """Run forever; on display failure, explain why on stderr and return 1.
+def cli(settings=None, serve_health=True):
+    """Run forever; on display or button failure, explain why on stderr and return 1.
 
-    Serves GET /health on `health_port` (None disables it).
+    Serves GET /health on the configured port unless `serve_health` is False.
     """
+    try:
+        settings = settings or Settings.from_env()
+    except ValueError as e:
+        print(f"ERROR: invalid setting: {e}", file=sys.stderr)
+        return 1
     where = f"I2C bus {I2C_PORT}, address {I2C_ADDRESS:#04x}"
     heartbeat = Heartbeat()
-    if health_port is not None:
-        server = make_health_server(heartbeat, port=health_port)
+    if serve_health:
+        server = make_health_server(heartbeat, port=settings.health_port)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+    events = queue.Queue()
     try:
-        main(heartbeat=heartbeat)
+        start_button(settings.button_line, settings.button_chip, events)
+        main(settings=settings, events=events, heartbeat=heartbeat)
+    except ButtonUnavailableError as e:
+        print(
+            f"ERROR: could not use the display button (GPIO line {settings.button_line}): {e}\n"
+            "Check that the right /dev/gpiochip* is passed into the container "
+            "(GPIO_DEVICE) and that no other program, such as Argon's own daemon, "
+            "is using the line.",
+            file=sys.stderr,
+        )
     except DeviceNotFoundError as e:
         print(
             f"ERROR: could not talk to the OLED display ({where}): {e}\n"

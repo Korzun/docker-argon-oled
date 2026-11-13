@@ -1,4 +1,5 @@
 import json
+import queue
 import threading
 import urllib.error
 import urllib.request
@@ -9,8 +10,22 @@ from luma.core.device import dummy
 from luma.core.error import DeviceNotFoundError, DevicePermissionError
 
 import main
+from containers import Container
+from pages import Snapshot
+from state import ButtonEvent, Mode
+from sysinfo import HostInfo
 
 STATS = {"cpu": 12.34, "temp": 45.678, "mem": 34.5, "disk": 6.0}
+HOST = HostInfo(hostname="pi", ip="192.168.1.42", uptime_s=3600)
+GOOD = [Container("coolify", True, "healthy")]
+BAD = [Container("coolify", True, "healthy"), Container("postgres", True, "unhealthy")]
+SNAP = Snapshot(stats=STATS, containers=GOOD, host=HOST)
+
+
+@pytest.fixture(autouse=True)
+def no_real_button(monkeypatch):
+    """Never touch GPIO in tests; individual tests override this."""
+    monkeypatch.setattr(main, "start_button", lambda line, chip, out: None)
 
 
 def test_cpu_temp_converts_millidegrees(tmp_path):
@@ -43,35 +58,6 @@ def test_read_stats_collects_values(tmp_path, monkeypatch):
     assert disk_paths == ["/somewhere"]
 
 
-def test_render_text_and_positions():
-    draw = MagicMock()
-    main.render(draw, STATS)
-    calls = [(c.args[0], c.args[1]) for c in draw.text.call_args_list]
-    assert calls == [
-        ((0, 0), "CPU   12.3%"),
-        ((0, 14), "Temp  45.7C"),
-        ((0, 28), "Mem   34.5%"),
-        ((0, 42), "Disk   6.0%"),
-    ]
-
-
-def test_render_draws_pixels_in_each_row_on_dummy_device():
-    device = dummy(width=main.WIDTH, height=main.HEIGHT)
-    with main.canvas(device) as draw:
-        main.render(draw, STATS)
-    image = device.image.convert("L")
-    for top in (0, 14, 28, 42):
-        band = image.crop((0, top, main.WIDTH, top + 12))
-        assert band.getbbox() is not None, f"nothing drawn at y={top}"
-
-
-def test_main_runs_requested_iterations(monkeypatch):
-    monkeypatch.setattr(main, "read_stats", lambda: STATS)
-    device = dummy(width=main.WIDTH, height=main.HEIGHT)
-    main.main(device=device, interval=0, iterations=3)
-    assert device.image.convert("L").getbbox() is not None
-
-
 def test_read_stats_missing_thermal_file_gives_none(tmp_path, monkeypatch):
     monkeypatch.setattr(main.psutil, "cpu_percent", lambda: 1.0)
     monkeypatch.setattr(main.psutil, "virtual_memory", lambda: MagicMock(percent=2.0))
@@ -80,16 +66,9 @@ def test_read_stats_missing_thermal_file_gives_none(tmp_path, monkeypatch):
     assert stats["temp"] is None
 
 
-def test_render_shows_na_when_temp_missing():
-    draw = MagicMock()
-    main.render(draw, {**STATS, "temp": None})
-    texts = [c.args[1] for c in draw.text.call_args_list]
-    assert "Temp   n/a" in texts
-
-
 def test_cli_returns_zero_on_clean_exit(monkeypatch):
     monkeypatch.setattr(main, "main", lambda **k: None)
-    assert main.cli(health_port=None) == 0
+    assert main.cli(serve_health=False) == 0
 
 
 def test_cli_explains_missing_display(monkeypatch, capsys):
@@ -97,7 +76,7 @@ def test_cli_explains_missing_display(monkeypatch, capsys):
         raise DeviceNotFoundError("I2C device not found: /dev/i2c-1")
 
     monkeypatch.setattr(main, "make_device", boom)
-    assert main.cli(health_port=None) == 1
+    assert main.cli(serve_health=False) == 1
     err = capsys.readouterr().err
     assert "could not talk to the OLED display" in err
     assert "I2C bus 1, address 0x3c" in err
@@ -110,7 +89,7 @@ def test_cli_explains_permission_error(monkeypatch, capsys):
         raise DevicePermissionError("I2C device permission denied: /dev/i2c-1")
 
     monkeypatch.setattr(main, "make_device", boom)
-    assert main.cli(health_port=None) == 1
+    assert main.cli(serve_health=False) == 1
     err = capsys.readouterr().err
     assert "permission denied" in err
 
@@ -118,14 +97,15 @@ def test_cli_explains_permission_error(monkeypatch, capsys):
 def test_cli_explains_display_lost_mid_run(monkeypatch, capsys):
     device = dummy(width=main.WIDTH, height=main.HEIGHT)
     monkeypatch.setattr(main, "make_device", lambda: device)
-    monkeypatch.setattr(main, "read_stats", lambda: STATS)
+    monkeypatch.setattr(main, "collect_snapshot", lambda url: SNAP)
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
+    monkeypatch.setattr(main, "start_button", lambda line, chip, out: out.put(ButtonEvent.SHORT))
 
     def unplug(*a, **k):
         raise DeviceNotFoundError("display disconnected")
 
     monkeypatch.setattr(device, "display", unplug)
-    assert main.cli(health_port=None) == 1
+    assert main.cli(serve_health=False) == 1
     assert "display disconnected" in capsys.readouterr().err
 
 
@@ -151,14 +131,6 @@ def test_health_status_starting_ok_and_stale():
     clock.now += 7  # 11s since last beat
     code, body = main.health_status(hb, max_age=10)
     assert (code, body["status"]) == (503, "stale")
-
-
-def test_main_beats_heartbeat_each_iteration(monkeypatch):
-    monkeypatch.setattr(main, "read_stats", lambda: STATS)
-    hb = main.Heartbeat()
-    device = dummy(width=main.WIDTH, height=main.HEIGHT)
-    main.main(device=device, interval=0, iterations=1, heartbeat=hb)
-    assert hb.age() is not None
 
 
 @pytest.fixture
@@ -235,3 +207,175 @@ def test_make_device_rotation(monkeypatch, env, arg, rotate):
     main.make_device(flip=arg)
 
     assert fake_ssd1306.call_args.kwargs["rotate"] == rotate
+
+
+# --- main loop ------------------------------------------------------------
+
+
+class RecordingDevice(dummy):
+    def __init__(self):
+        super().__init__(width=main.WIDTH, height=main.HEIGHT)
+        self.calls = []
+        self.frames = 0
+
+    def show(self):
+        self.calls.append("show")
+        super().show()
+
+    def hide(self):
+        self.calls.append("hide")
+        super().hide()
+
+    def contrast(self, level):
+        self.calls.append(("contrast", level))
+        super().contrast(level)
+
+    def display(self, image):
+        self.frames += 1
+        super().display(image)
+
+
+class Loop:
+    """Runs main.main with a fake clock whose sleep advances time by one tick."""
+
+    def __init__(self, containers=GOOD):
+        self.clock = FakeClock()
+        self.device = RecordingDevice()
+        self.events = queue.Queue()
+        self.heartbeat = main.Heartbeat(clock=self.clock)
+        self.containers = containers
+        self.controller = main.Controller(clock=self.clock)
+
+    def collect(self, url):
+        return Snapshot(stats=STATS, containers=self.containers, host=HOST)
+
+    def run(self, iterations):
+        main.main(
+            device=self.device,
+            settings=main.Settings(),
+            controller=self.controller,
+            events=self.events,
+            heartbeat=self.heartbeat,
+            collect=self.collect,
+            clock=self.clock,
+            sleep=lambda s: setattr(self.clock, "now", self.clock.now + s),
+            iterations=iterations,
+        )
+
+
+def test_dark_by_default_never_draws_but_beats_heartbeat():
+    loop = Loop()
+    loop.run(50)
+    assert loop.device.frames == 0
+    assert loop.device.calls == ["hide"]  # once, not every tick
+    assert loop.heartbeat.age() is not None
+
+
+def test_press_wakes_and_draws_overview():
+    loop = Loop()
+    loop.events.put(ButtonEvent.SHORT)
+    loop.run(3)
+    assert loop.controller.mode == Mode.AWAKE
+    assert "show" in loop.device.calls and ("contrast", 255) in loop.device.calls
+    assert loop.device.frames >= 1
+    assert loop.device.image.convert("L").getbbox() is not None
+
+
+def test_press_advances_page_and_changes_drawn_content():
+    loop = Loop()
+    loop.events.put(ButtonEvent.SHORT)
+    loop.run(2)
+    first = loop.device.image.tobytes()
+    loop.events.put(ButtonEvent.SHORT)
+    loop.run(2)
+    assert loop.controller.page == 1
+    assert loop.device.image.tobytes() != first
+
+
+def test_unhealthy_container_wakes_without_button_and_uses_low_contrast():
+    loop = Loop(containers=BAD)
+    loop.run(3)
+    assert loop.controller.mode == Mode.ALERT
+    assert ("contrast", 64) in loop.device.calls
+    assert loop.device.frames >= 1
+
+
+def test_alert_stays_lit_until_press_then_normal_contrast():
+    loop = Loop(containers=BAD)
+    loop.run(400)  # 40 simulated seconds, well past the 30 s wake timeout
+    assert loop.controller.mode == Mode.ALERT
+    loop.events.put(ButtonEvent.SHORT)
+    loop.run(3)
+    assert loop.controller.mode == Mode.AWAKE
+    assert [c for c in loop.device.calls if isinstance(c, tuple)][-1] == ("contrast", 255)
+
+
+def test_screen_turns_off_after_timeout():
+    loop = Loop()
+    loop.events.put(ButtonEvent.SHORT)
+    loop.run(350)  # 35 simulated seconds
+    assert loop.controller.mode == Mode.OFF
+    assert loop.device.calls[-1] == "hide"
+
+
+def test_alert_drifts_content_over_time():
+    loop = Loop(containers=BAD)
+    loop.run(3)
+    before = loop.device.image.tobytes()
+    loop.run(620)  # just over 60 simulated seconds
+    assert loop.device.image.tobytes() != before
+
+
+def test_health_stays_ok_while_screen_is_dark():
+    loop = Loop()
+    loop.run(100)
+    assert main.health_status(loop.heartbeat, max_age=1.0)[0] == 200
+
+
+# --- settings -------------------------------------------------------------
+
+
+def test_settings_defaults_and_overrides():
+    d = main.Settings.from_env({})
+    assert (d.proxy_url, d.button_line, d.button_chip, d.health_port) == (
+        "http://127.0.0.1:2375", 4, None, 8099
+    )
+    o = main.Settings.from_env(
+        {"DOCKER_PROXY_URL": "http://h:1", "BUTTON_GPIO": "17", "BUTTON_CHIP": "/dev/gpiochip4", "HEALTH_PORT": "9000"}
+    )
+    assert (o.proxy_url, o.button_line, o.button_chip, o.health_port) == ("http://h:1", 17, "/dev/gpiochip4", 9000)
+
+
+def test_settings_rejects_non_numeric_gpio():
+    with pytest.raises(ValueError, match="BUTTON_GPIO"):
+        main.Settings.from_env({"BUTTON_GPIO": "four"})
+
+
+def test_health_server_defaults_to_loopback():
+    server = main.make_health_server(main.Heartbeat(), port=0)
+    try:
+        assert server.server_address[0] == "127.0.0.1"
+    finally:
+        server.server_close()
+
+
+# --- cli ------------------------------------------------------------------
+
+
+def test_cli_explains_button_unavailable(monkeypatch, capsys):
+    def boom(line, chip, out):
+        raise main.ButtonUnavailableError("GPIO device /dev/gpiochip0 does not exist")
+
+    monkeypatch.setattr(main, "start_button", boom)
+    assert main.cli(serve_health=False) == 1
+    err = capsys.readouterr().err
+    assert "button" in err.lower()
+    assert "GPIO line 4" in err
+    assert "/dev/gpiochip0 does not exist" in err
+    assert "Argon" in err
+
+
+def test_cli_explains_bad_settings(monkeypatch, capsys):
+    monkeypatch.setenv("BUTTON_GPIO", "four")
+    assert main.cli(serve_health=False) == 1
+    assert "BUTTON_GPIO" in capsys.readouterr().err
