@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psutil
@@ -194,6 +195,8 @@ def main(
     events = events if events is not None else queue.Queue()
 
     snapshot = None
+    last_containers = None  # last container list we actually got, for the alert page
+    collect_failing = False
     last_refresh = None
     previous_mode = None
     drawn = None
@@ -202,26 +205,43 @@ def main(
         now = clock()
         refreshed = last_refresh is None or now - last_refresh >= REFRESH_SECONDS
         if refreshed:
-            snapshot = collect(settings.proxy_url)
             last_refresh = now
-            controller.on_containers(unhealthy_names(snapshot.containers))
+            try:
+                fresh = collect(settings.proxy_url)
+            except Exception as e:  # a transient failure must not end the loop
+                if not collect_failing:
+                    print(f"WARNING: could not collect status, keeping the last values: {e!r}", file=sys.stderr)
+                collect_failing = True
+                refreshed = False
+            else:
+                collect_failing = False
+                snapshot = fresh
+                if fresh.containers is not None:
+                    last_containers = fresh.containers
+                controller.on_containers(unhealthy_names(fresh.containers))
         while True:
             try:
-                controller.on_button(events.get_nowait())
+                item = events.get_nowait()
             except queue.Empty:
                 break
+            if isinstance(item, Exception):  # the button thread died
+                raise item
+            controller.on_button(item)
         controller.tick()
 
         mode = controller.mode
         apply_mode(device, mode, previous_mode)
         previous_mode = mode
-        if mode is Mode.OFF:
+        if mode is Mode.OFF or snapshot is None:
             drawn = None
         else:
             offset = drift_offset(controller.alert_elapsed()) if mode is Mode.ALERT else (0, 0)
             key = (mode, controller.page, offset)
             if refreshed or key != drawn:
-                content = build_page(controller.page, snapshot, alert=mode is Mode.ALERT)
+                shown = snapshot
+                if mode is Mode.ALERT and snapshot.containers is None and last_containers is not None:
+                    shown = replace(snapshot, containers=last_containers)  # keep naming the bad containers
+                content = build_page(controller.page, shown, alert=mode is Mode.ALERT)
                 with canvas(device) as draw:
                     draw_page(draw, content, offset)
                 drawn = key
@@ -230,6 +250,10 @@ def main(
             heartbeat.beat()
         count += 1
         sleep(tick)
+
+
+def _exit_on_sigterm(signum, frame):
+    raise SystemExit(0)  # unwinds normally so luma's atexit hook switches the panel off
 
 
 def cli(settings=None, serve_health=True):
@@ -242,6 +266,7 @@ def cli(settings=None, serve_health=True):
     except ValueError as e:
         print(f"ERROR: invalid setting: {e}", file=sys.stderr)
         return 1
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)  # `docker stop` must not leave a frame lit
     where = f"I2C bus {I2C_PORT}, address {I2C_ADDRESS:#04x}"
     heartbeat = Heartbeat()
     if serve_health:

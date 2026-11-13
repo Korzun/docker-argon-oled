@@ -123,11 +123,14 @@ def start_button(
 ) -> threading.Thread:
     """Open the button line (raises ButtonUnavailableError) and pump events on a daemon thread."""
     source = GpiodEdgeSource(line, chip)
-    thread = threading.Thread(
-        target=pump_events,
-        args=(source, PressClassifier(), out, stop or threading.Event()),
-        daemon=True,
-        name="button",
-    )
+    stop = stop or threading.Event()
+
+    def run() -> None:
+        try:
+            pump_events(source, PressClassifier(), out, stop)
+        except Exception as e:  # tell the main loop; a dead button must not fail silently
+            out.put(ButtonUnavailableError(f"button input stopped: {e}"))
+
+    thread = threading.Thread(target=run, daemon=True, name="button")
     thread.start()
     return thread

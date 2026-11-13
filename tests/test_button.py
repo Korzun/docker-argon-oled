@@ -221,3 +221,25 @@ def test_auto_chip_detection_with_no_chip_present_raises_unavailable(monkeypatch
     monkeypatch.setattr(button, "CHIP_CANDIDATES", ("/nonexistent/gpiochip4", "/nonexistent/gpiochip0"))
     with pytest.raises(ButtonUnavailableError, match="gpiochip"):
         button.GpiodEdgeSource(4, None)
+
+
+def test_button_thread_failure_is_reported_on_the_queue(monkeypatch):
+    stop = threading.Event()
+    out = queue.Queue()
+
+    class Dying:
+        def __init__(self, line, chip=None):
+            pass
+
+        def wait_edge(self, timeout):
+            raise OSError("device went away")
+
+    monkeypatch.setattr(button, "GpiodEdgeSource", Dying)
+    thread = button.start_button(4, None, out, stop=stop)
+    try:
+        err = out.get(timeout=3)
+        assert isinstance(err, ButtonUnavailableError)
+        assert "device went away" in str(err)
+    finally:
+        stop.set()
+        thread.join(timeout=2)

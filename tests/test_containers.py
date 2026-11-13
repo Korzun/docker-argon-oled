@@ -1,5 +1,8 @@
+import http.client
 import io
 import json
+import socket
+import threading
 import urllib.error
 
 import containers
@@ -113,3 +116,30 @@ def test_fetch_returns_none_on_malformed_json():
 
 def test_fetch_returns_none_when_json_is_not_a_list():
     assert containers.fetch_containers("http://x", opener=opener_returning(b'{"message": "forbidden"}')) is None
+
+
+def test_fetch_returns_none_on_http_protocol_errors():
+    for exc in (http.client.IncompleteRead(b"[{"), http.client.BadStatusLine("garbage")):
+        def opener(url, timeout=None, exc=exc):
+            raise exc
+
+        assert containers.fetch_containers("http://x", opener=opener) is None
+
+
+def test_fetch_returns_none_on_truncated_body_from_a_real_socket():
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+
+    def serve():
+        conn, _ = server.accept()
+        conn.recv(4096)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\nContent-Type: application/json\r\n\r\n[{")
+        conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.getsockname()[1]}"
+        assert containers.fetch_containers(url, timeout=2) is None
+    finally:
+        server.close()

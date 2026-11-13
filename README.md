@@ -42,7 +42,7 @@ The container restarts automatically unless stopped (`restart: unless-stopped`).
 
 - `main.py` runs a 0.1 s loop that wires everything together. The other modules each do one job: `state.py` (off / awake / alert logic), `pages.py` (page content and drawing), `button.py` (GPIO button input), `containers.py` (container health), `sysinfo.py` (hostname, IP, uptime).
 - The display is driven with [luma.oled](https://github.com/rm-hull/luma.oled); stats come from [psutil](https://github.com/giampaolo/psutil). The button is read with [libgpiod](https://git.kernel.org/pub/scm/libs/libgpiod/libgpiod.git/) edge events: GPIO line 4 on `/dev/gpiochip0`, active-low.
-- **Container health goes through a read-only proxy.** `docker-compose.yml` runs [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) with only the containers endpoints enabled and writes disabled. It is the only service that mounts the Docker socket, and it listens on `127.0.0.1:2375` only. The display app never has control of Docker. (Mounting the socket read-only into the app would not help: `:ro` doesn't limit what the Docker API allows.)
+- **Container health goes through a read-only proxy.** `docker-compose.yml` runs [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) with only the containers endpoints enabled and writes disabled. It is the only service that mounts the Docker socket, and it listens on `127.0.0.1:2375` only. The display app never has control of Docker. Know the trade-off: the proxy's `CONTAINERS=1` setting allows read-only requests to every `/containers/*` endpoint, including a container's environment (`/containers/<id>/json`) and logs, and port 2375 is reachable by any process on the Pi. If other users or untrusted host-network containers run there, swap in a proxy that can allow only the list endpoint. (Mounting the socket read-only into the app would not help: `:ro` doesn't limit what the Docker API allows.)
 - The `oled` service uses **host networking** so it can show the Pi's real LAN IP and reach the proxy on `127.0.0.1`. It also mounts the host root read-only at `/host` so disk usage and the hostname reflect the host.
 
 ## Configuration
@@ -53,7 +53,7 @@ The container restarts automatically unless stopped (`restart: unless-stopped`).
 | `GPIO_DEVICE`     | `/dev/gpiochip0`   | GPIO chip device passed into the container and used for the button. On a Pi 5, `gpiodetect` shows the header chip as `pinctrl-rp1`. |
 | `BUTTON_GPIO`     | `4`                | GPIO line of the OLED button on that chip (active-low). |
 | `HEALTH_PORT`     | `8099`             | Port for the `/health` endpoint, bound to `127.0.0.1`. |
-| `HOST_IP`         | (auto-detected)    | Override the IP address shown, if auto-detection picks the wrong one. Set it in the service's environment. |
+| `HOST_IP`         | (auto-detected)    | Override the IP address shown, if auto-detection picks the wrong one. |
 
 Set variables in a `.env` file next to `docker-compose.yml`, in your shell, or in Coolify's Environment Variables, then redeploy (a restart doesn't pick them up). Other settings, such as the wake timeout, I2C address or display size, are constants in the code.
 

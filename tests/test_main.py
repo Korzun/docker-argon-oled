@@ -1,5 +1,6 @@
 import json
 import queue
+import signal
 import threading
 import urllib.error
 import urllib.request
@@ -379,3 +380,107 @@ def test_cli_explains_bad_settings(monkeypatch, capsys):
     monkeypatch.setenv("BUTTON_GPIO", "four")
     assert main.cli(serve_health=False) == 1
     assert "BUTTON_GPIO" in capsys.readouterr().err
+
+
+# --- review fixes ---------------------------------------------------------
+
+
+def test_collect_failure_does_not_crash_loop_and_keeps_last_snapshot(capsys):
+    loop = Loop()
+    loop.events.put(ButtonEvent.SHORT)
+    calls = {"n": 0, "frames": None}
+
+    def flaky(url):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            calls["frames"] = loop.device.frames
+            loop.events.put(ButtonEvent.SHORT)  # a press arrives while collection is failing
+        if calls["n"] >= 3:
+            raise OSError("disk went away")
+        return Snapshot(stats=STATS, containers=GOOD, host=HOST)
+
+    loop.collect = flaky
+    loop.run(100)  # 10 simulated seconds: several failing refreshes
+    assert calls["n"] > 3
+    assert loop.controller.page == 1
+    assert loop.device.frames > calls["frames"]  # the press still drew, from the last good snapshot
+    err = capsys.readouterr().err
+    assert err.count("could not collect status") == 1  # logged once per failure streak
+    assert "disk went away" in err
+
+
+def test_collect_failing_from_the_start_still_beats_heartbeat_and_does_not_crash():
+    loop = Loop()
+
+    def boom(url):
+        raise OSError("no /host")
+
+    loop.collect = boom
+    loop.events.put(ButtonEvent.SHORT)
+    loop.run(30)
+    assert loop.heartbeat.age() is not None
+    assert loop.device.frames == 0  # nothing to draw yet, but no crash
+
+
+def test_alert_page_keeps_names_when_the_proxy_drops(monkeypatch):
+    seen = []
+    real = main.build_page
+
+    def spy(page, snap, alert=False):
+        seen.append((alert, snap.containers))
+        return real(page, snap, alert=alert)
+
+    monkeypatch.setattr(main, "build_page", spy)
+    loop = Loop()
+    calls = {"n": 0}
+
+    def proxy_drops(url):
+        calls["n"] += 1
+        containers = BAD if calls["n"] <= 2 else None  # proxy restarts during maintenance
+        return Snapshot(stats=STATS, containers=containers, host=HOST)
+
+    loop.collect = proxy_drops
+    loop.run(100)
+    assert calls["n"] > 3
+    assert loop.controller.mode == Mode.ALERT
+    alert, shown = seen[-1]
+    assert alert is True
+    assert shown is not None and any(c.name == "postgres" and c.health == "unhealthy" for c in shown)
+
+
+def test_button_failure_on_the_queue_stops_the_loop_with_the_error():
+    loop = Loop()
+    loop.events.put(main.ButtonUnavailableError("button input stopped: gone"))
+    with pytest.raises(main.ButtonUnavailableError, match="gone"):
+        loop.run(3)
+
+
+@pytest.fixture
+def restore_sigterm():
+    previous = signal.getsignal(signal.SIGTERM)
+    yield
+    signal.signal(signal.SIGTERM, previous)
+
+
+def test_cli_installs_sigterm_handler_that_exits_cleanly(monkeypatch, restore_sigterm):
+    monkeypatch.setattr(main, "main", lambda **k: None)
+    main.cli(serve_health=False)
+    handler = signal.getsignal(signal.SIGTERM)
+    assert callable(handler)
+    with pytest.raises(SystemExit) as exc:
+        handler(signal.SIGTERM, None)  # SystemExit lets luma's atexit hook switch the panel off
+    assert exc.value.code == 0
+
+
+def test_every_documented_env_var_is_forwarded_by_compose():
+    import os
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    readme = open(os.path.join(root, "README.md")).read()
+    compose = open(os.path.join(root, "docker-compose.yml")).read()
+    table = readme.split("## Configuration", 1)[1].split("\n## ", 1)[0]
+    names = re.findall(r"^\| `([A-Z][A-Z0-9_]+)`", table, re.M)
+    assert names, "no variables found in the README Configuration table"
+    missing = [n for n in names if n not in compose]
+    assert not missing, f"documented but not forwarded by docker-compose.yml: {missing}"

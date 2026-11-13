@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.request
@@ -55,7 +56,7 @@ def fetch_containers(
     try:
         with opener(f"{base_url}/containers/json?all=1", timeout=timeout) as resp:
             payload = json.load(resp)
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return None
     if not isinstance(payload, list):
         return None

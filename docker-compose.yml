@@ -32,6 +32,7 @@ services:
       - BUTTON_CHIP=${GPIO_DEVICE:-/dev/gpiochip0}
       - DOCKER_PROXY_URL=http://127.0.0.1:2375
       - HEALTH_PORT=${HEALTH_PORT:-8099}
+      - HOST_IP=${HOST_IP:-}   # optional: override the IP shown on screen
     healthcheck:
       # No curl in the slim image; urlopen raises on a 503, failing the check.
       test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('HEALTH_PORT', '8099'), timeout=3)"]
