@@ -545,3 +545,17 @@ def test_proxy_port_is_configurable_in_compose():
     compose = open(os.path.join(root, "docker-compose.yml")).read()
     assert "127.0.0.1:${PROXY_PORT:-2375}:2375" in compose
     assert "DOCKER_PROXY_URL=http://127.0.0.1:${PROXY_PORT:-2375}" in compose
+
+
+def test_every_compose_service_has_a_healthcheck():
+    """Coolify reports a stack as having no healthcheck if any service lacks one."""
+    import os
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    compose = open(os.path.join(root, "docker-compose.yml")).read()
+    body = compose.split("services:\n", 1)[1]
+    blocks = re.split(r"^  (?=[a-z][\w-]*:\s*$)", body, flags=re.M)[1:]
+    assert len(blocks) >= 2, "expected the oled and docker-proxy services"
+    missing = [b.split(":", 1)[0] for b in blocks if "healthcheck:" not in b]
+    assert not missing, f"services without a healthcheck: {missing}"

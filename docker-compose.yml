@@ -12,6 +12,13 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
       - "127.0.0.1:${PROXY_PORT:-2375}:2375"   # loopback only: reachable from the Pi, not the LAN
+    healthcheck:
+      # The image has wget; /_ping answers OK while the proxy can reach the Docker daemon.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2375/_ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   oled:
     build: .
